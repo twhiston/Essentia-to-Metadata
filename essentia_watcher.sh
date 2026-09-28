@@ -76,6 +76,10 @@ POLL_LOOKBACK="${POLL_LOOKBACK:-600}"
 # Poll mode: persistent state (last scan time, processed files)
 STATE_DIR="${STATE_DIR:-/var/lib/essentia-tagger}"
 
+# Poll mode: seconds to keep processed-file entries (0 = keep forever).
+# Must exceed POLL_INTERVAL + POLL_LOOKBACK or files get tagged twice.
+PROCESSED_RETENTION="${PROCESSED_RETENTION:-86400}"
+
 # Cooldown period in seconds (skip files processed within this time)
 # Prevents feedback loop when tagger writes metadata back to the file
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-120}"
@@ -142,6 +146,12 @@ check_dependencies() {
     
     if [ "$WATCH_MODE" != "inotify" ] && [ "$WATCH_MODE" != "poll" ]; then
         log_error "Invalid WATCH_MODE: $WATCH_MODE (use 'inotify' or 'poll')"
+        exit 1
+    fi
+
+    if [ "$WATCH_MODE" = "poll" ] && [ "$PROCESSED_RETENTION" -ne 0 ] && \
+       [ "$PROCESSED_RETENTION" -le $((POLL_INTERVAL + POLL_LOOKBACK)) ]; then
+        log_error "PROCESSED_RETENTION ($PROCESSED_RETENTION) must be greater than POLL_INTERVAL + POLL_LOOKBACK ($((POLL_INTERVAL + POLL_LOOKBACK))), or 0 to keep forever"
         exit 1
     fi
     
@@ -379,6 +389,16 @@ poll_directory() {
         
         last_scan=$until
         echo "$last_scan" > "$last_scan_file"
+
+        # Drop entries by their recorded mtime. Once past the scan window a
+        # file only reappears if it changes, and then its entry no longer
+        # matches anyway.
+        if [ "$PROCESSED_RETENTION" -ne 0 ]; then
+            awk -v cutoff=$(($(date +%s) - PROCESSED_RETENTION)) '$1 >= cutoff' \
+                "$processed_file" > "$processed_file.tmp" && \
+                mv "$processed_file.tmp" "$processed_file"
+        fi
+
         sleep "$POLL_INTERVAL"
     done
 }
@@ -414,6 +434,7 @@ Environment Variables:
     POLL_INTERVAL   Poll mode: seconds between scans (default: 300)
     POLL_LOOKBACK   Poll mode: scan overlap for clock skew (default: 600)
     STATE_DIR       Poll mode: persistent state dir (default: /var/lib/essentia-tagger)
+    PROCESSED_RETENTION Poll mode: seconds to remember tagged files, 0 = forever (default: 86400)
     TAGGER_SCRIPT   Path to tag_music.py
     VENV_PATH       Path to Python venv
     MODEL_DIR       Path to Essentia models
