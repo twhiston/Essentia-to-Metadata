@@ -371,6 +371,76 @@ echo "fs.inotify.max_user_watches=524288" >> /etc/sysctl.conf
 sysctl -p
 ```
 
+### Files Not Detected on a Network Mount (NFS/SMB)
+
+inotify only sees changes made by the machine it runs on. If the watcher runs on a different machine from the one writing the files, `inotifywait` runs without errors but never reports those files. For example, the watcher might run in a Navidrome container with the music mounted from a NAS, while Picard writes to the NAS from your desktop.
+
+To check, run `inotifywait -m -r "<watch dir>"`, then create a file in the watch directory, first from the watcher's machine and then from the machine that normally writes the files. If only the first produces an event, switch to poll mode:
+
+```bash
+# In /etc/systemd/system/essentia-tagger.service:
+Environment="WATCH_MODE=poll"
+Environment="POLL_INTERVAL=300"     # seconds between scans
+Environment="POLL_LOOKBACK=600"     # scan overlap, absorbs clock skew between machines
+```
+
+How poll mode works:
+
+- Each scan looks for folders whose ctime changed since the last scan, then checks only those folders for new audio files.
+- Everything a scan finds is tagged in one tagger run, so the models load once per batch instead of once per track.
+- Each tagged file's mtime and size are recorded in `/var/lib/essentia-tagger/processed`, so the tagger's own writes don't trigger another round. `PROCESSED_RETENTION` sets how long entries are kept, in seconds (default one day, `0` keeps them forever).
+- On first start it only tags files added from that point on. It does not tag the existing library.
+- Poll mode detects files **added** to a folder, which is what Picard does when it moves files in. A file edited in place is not detected.
+
+Each scan logs a line such as `Scan: 3 new file(s) in 22s`. Tagger output then appears per file as it is processed.
+
+### Re-Tagging Files After a Failure in Poll Mode
+
+A file that fails to tag is still recorded, so it isn't retried every scan. Once the cause is fixed, clear the state and move the scan start back to before the files arrived:
+
+```bash
+systemctl stop essentia-tagger
+rm /var/lib/essentia-tagger/processed
+date -d 'today 13:00' +%s > /var/lib/essentia-tagger/last-scan
+systemctl start essentia-tagger
+```
+
+The first scan then picks up everything added since that time, minus `POLL_LOOKBACK`.
+
+If the tagger itself fails, for example when the models can't load, nothing is recorded. The same files are retried at the next scan automatically.
+
+### Poll Mode Scans Are Slow
+
+On a network mount, the scan time is mostly one network round trip per folder listed. Checks per file add little. The watcher walks `SCAN_JOBS` subtrees in parallel (default 16), one per second-level folder (for example `{letter}/{artist}`). It also skips Synology `@eaDir` index folders.
+
+- Compare the `Scan:` log line with the NAS idle and busy. Another program walking the same share slows scans a lot, for example Navidrome's library scan. In one setup a scan took 22 s with the NAS idle and over 2 minutes during a Navidrome scan.
+- If scans are still slow on an idle NAS, try `SCAN_JOBS=32`. If that barely helps, the NAS itself is the bottleneck.
+
+### Permission Denied Writing Tags (Proxmox LXC)
+
+The watcher only needs to read the files to detect them, but tagging writes to them. A share that works fine for a read-only service like Navidrome can still be unwritable. To test, run this from inside the container:
+
+```bash
+touch "<watch dir>/<some album>/.wtest" && rm "$_" && echo writable
+```
+
+In an **unprivileged** container (`unprivileged: 1` in `/etc/pve/lxc/<CTID>.conf`), root inside the container is uid 100000 on the host. If the host mounts the share as `uid=0,gid=0`, files show as owned by `65534` (nobody) inside the container, and the container's root can't write to them.
+
+For an SMB/CIFS share added as Proxmox storage (mounted under `/mnt/pve/<storage>` and bind-mounted into the container), run this on the host:
+
+```bash
+pvesm set <storage> --options uid=100000,gid=100000
+pct stop <CTID>                # and any other guest using this storage
+umount /mnt/pve/<storage>
+pvesm status                   # Proxmox remounts the storage
+findmnt /mnt/pve/<storage>     # should show uid=100000,gid=100000
+pct start <CTID>
+```
+
+Writes still reach the NAS as the SMB user from the storage credentials, so that user needs write access to the share.
+
+For NFS, map the writes on the NAS instead. Set the export to `all_squash` with `anonuid`/`anongid` set to the uid/gid that owns the music files.
+
 ### Essentia Errors
 
 ```bash

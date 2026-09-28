@@ -63,7 +63,8 @@ AUDIO_EXTENSIONS="flac|mp3|ogg|oga|opus|m4a|m4b|mp4|aac|wma|aiff|aif|wav|wv|ape|
 
 # Watch mode: "inotify" (instant, local disks only) or "poll" (periodic scan).
 # Use poll when WATCH_DIR is a network mount (NFS/SMB) written to by another
-# machine - inotify never sees those changes.
+# machine - inotify never sees those changes. Poll detects files added to a
+# folder (as Picard does when moving files in), not files edited in place.
 WATCH_MODE="${WATCH_MODE:-inotify}"
 
 # Poll mode: seconds between scans
@@ -72,6 +73,10 @@ POLL_INTERVAL="${POLL_INTERVAL:-300}"
 # Poll mode: extra seconds each scan looks back past the previous one, to
 # absorb clock skew between this machine and the NAS and slow copies
 POLL_LOOKBACK="${POLL_LOOKBACK:-600}"
+
+# Poll mode: folders to walk at once when scanning. Each folder listing on a
+# network mount waits on a round trip, so parallel walks are much faster.
+SCAN_JOBS="${SCAN_JOBS:-16}"
 
 # Poll mode: parallel tagger workers per batch (0 = half the CPU cores).
 # Each worker loads its own copy of the models, so this costs memory.
@@ -349,6 +354,38 @@ watch_directory() {
     done
 }
 
+# Print (NUL-separated) folders under WATCH_DIR whose ctime is after $1.
+# Walks one subtree per second-level folder (e.g. artist), SCAN_JOBS at a
+# time. Each job writes its own file, since parallel writes to one pipe can
+# interleave mid-path. Runs in a subshell without set -e, so a find error
+# (e.g. a folder removed mid-walk) doesn't abort the scan.
+# Skips Synology @eaDir index folders.
+find_changed_dirs() (
+    set +e
+    local since="$1"
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir "$tmp/l2" "$tmp/out"
+
+    # WATCH_DIR and its immediate subfolders (e.g. letters)
+    find "$WATCH_DIR" -maxdepth 1 -type d ! -name '@eaDir' -newerct "@$since" -print0
+
+    # Second-level folders, listed in parallel
+    find "$WATCH_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '@eaDir' -print0 \
+        | xargs -0 -r -P "$SCAN_JOBS" -I{} sh -c \
+            'find "$1" -mindepth 1 -maxdepth 1 -type d ! -name "@eaDir" -print0 > "$(mktemp -p "$2")"' \
+            _ {} "$tmp/l2"
+
+    # Everything from the second level down, walked in parallel
+    cat "$tmp"/l2/* 2>/dev/null \
+        | xargs -0 -r -P "$SCAN_JOBS" -I{} sh -c \
+            'find "$1" -name "@eaDir" -prune -o -type d -newerct "@$3" -print0 > "$(mktemp -p "$2")"' \
+            _ {} "$tmp/out" "$since"
+
+    cat "$tmp"/out/* 2>/dev/null
+    rm -rf "$tmp"
+)
+
 # Poll loop - for network mounts where inotify doesn't see remote writes
 poll_directory() {
     local last_scan_file="$STATE_DIR/last-scan"
@@ -382,24 +419,35 @@ poll_directory() {
         # they may still be copying
         local until=$(($(date +%s) - DEBOUNCE_SECONDS))
         
-        # Match on ctime, not mtime: copies can preserve the source mtime, but
-        # ctime is always set when the file lands on the NAS
+        local scan_start=$(date +%s)
         local batch=()
-        while IFS= read -r -d '' filepath; do
-            # Skip files already processed in this exact state. The tagger's
-            # own writes change ctime, so they show up here again.
-            local sig
-            sig=$(stat -c '%Y %s' "$filepath" 2>/dev/null) || continue
-            if grep -qxF "${sig}|${filepath}" "$processed_file"; then
-                continue
-            fi
 
-            log_info "Detected: $filepath"
-            batch+=("$filepath")
-        done < <(find "$WATCH_DIR" -type f \
-                    -newerct "@$since" ! -newerct "@$until" \
-                    -regextype posix-extended -iregex ".*\.($AUDIO_EXTENSIONS)" \
-                    -print0)
+        # Only stat directories: adding a file to a folder changes the
+        # folder's ctime, and a stat per track is a network round trip.
+        # Files modified in place (not added) don't change their folder, so
+        # they aren't detected. No upper bound here - a folder's ctime only
+        # reflects its latest change, which may be after files in the window.
+        while IFS= read -r -d '' dir; do
+            # Match files on ctime, not mtime: copies can preserve the source
+            # mtime, but ctime is always set when the file lands on the NAS
+            while IFS= read -r -d '' filepath; do
+                # Skip files already processed in this exact state. A folder
+                # stays in the window for a while, so its files show up again.
+                local sig
+                sig=$(stat -c '%Y %s' "$filepath" 2>/dev/null) || continue
+                if grep -qxF "${sig}|${filepath}" "$processed_file"; then
+                    continue
+                fi
+
+                log_info "Detected: $filepath"
+                batch+=("$filepath")
+            done < <(find "$dir" -maxdepth 1 -type f \
+                        -newerct "@$since" ! -newerct "@$until" \
+                        -regextype posix-extended -iregex ".*\.($AUDIO_EXTENSIONS)" \
+                        -print0)
+        done < <(find_changed_dirs "$since")
+
+        log "Scan: ${#batch[@]} new file(s) in $(($(date +%s) - scan_start))s"
 
         local scan_ok=true
         if [ ${#batch[@]} -gt 0 ]; then
@@ -470,6 +518,7 @@ Environment Variables:
     WATCH_MODE      'inotify' or 'poll' - use poll for NFS/SMB mounts (default: inotify)
     POLL_INTERVAL   Poll mode: seconds between scans (default: 300)
     POLL_LOOKBACK   Poll mode: scan overlap for clock skew (default: 600)
+    SCAN_JOBS       Poll mode: folders to walk in parallel when scanning (default: 16)
     WORKERS         Poll mode: parallel tagger workers, 0 = half CPU cores (default: 1)
     STATE_DIR       Poll mode: persistent state dir (default: /var/lib/essentia-tagger)
     PROCESSED_RETENTION Poll mode: seconds to remember tagged files, 0 = forever (default: 86400)
