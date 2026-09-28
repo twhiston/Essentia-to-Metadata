@@ -73,6 +73,10 @@ POLL_INTERVAL="${POLL_INTERVAL:-300}"
 # absorb clock skew between this machine and the NAS and slow copies
 POLL_LOOKBACK="${POLL_LOOKBACK:-600}"
 
+# Poll mode: parallel tagger workers per batch (0 = half the CPU cores).
+# Each worker loads its own copy of the models, so this costs memory.
+WORKERS="${WORKERS:-1}"
+
 # Poll mode: persistent state (last scan time, processed files)
 STATE_DIR="${STATE_DIR:-/var/lib/essentia-tagger}"
 
@@ -163,11 +167,9 @@ check_dependencies() {
 
 # Build the tagger command arguments
 build_tagger_args() {
-    local filepath="$1"
     local args=""
-    
+
     args="--auto"
-    args="$args --single-file"
     args="$args --genres $GENRES"
     args="$args --genre-threshold $GENRE_THRESHOLD"
     args="$args --mood-threshold $MOOD_THRESHOLD"
@@ -248,12 +250,12 @@ process_file() {
     log "Processing: $filepath"
     
     # Build arguments
-    local args=$(build_tagger_args "$filepath")
-    
+    local args=$(build_tagger_args)
+
     # Activate virtual environment and run tagger
     (
         source "$VENV_PATH/bin/activate"
-        python3 "$TAGGER_SCRIPT" "$filepath" $args
+        python3 "$TAGGER_SCRIPT" "$filepath" --single-file $args
     )
     
     local status=$?
@@ -265,6 +267,24 @@ process_file() {
         log_error "Failed to tag: $filepath (exit code: $status)"
     fi
     
+    return $status
+}
+
+# Tag several files in one tagger run, so the models load once
+tag_batch() {
+    local list_file
+    list_file=$(mktemp)
+    printf '%s\0' "$@" > "$list_file"
+
+    log "Processing ${#} file(s)"
+    local args=$(build_tagger_args)
+    local status=0
+    (
+        source "$VENV_PATH/bin/activate"
+        python3 "$TAGGER_SCRIPT" --file-list "$list_file" --workers "$WORKERS" $args
+    ) </dev/null || status=$?
+
+    rm -f "$list_file"
     return $status
 }
 
@@ -364,6 +384,7 @@ poll_directory() {
         
         # Match on ctime, not mtime: copies can preserve the source mtime, but
         # ctime is always set when the file lands on the NAS
+        local batch=()
         while IFS= read -r -d '' filepath; do
             # Skip files already processed in this exact state. The tagger's
             # own writes change ctime, so they show up here again.
@@ -372,23 +393,39 @@ poll_directory() {
             if grep -qxF "${sig}|${filepath}" "$processed_file"; then
                 continue
             fi
-            
+
             log_info "Detected: $filepath"
-            # </dev/null so the tagger can't consume the file list
-            if ! process_file "$filepath" </dev/null; then
-                log_warn "Not retrying until the file changes: $filepath"
-            fi
-            
-            # Record the post-tagging state so the rewrite isn't picked up again
-            sig=$(stat -c '%Y %s' "$filepath" 2>/dev/null) || continue
-            echo "${sig}|${filepath}" >> "$processed_file"
+            batch+=("$filepath")
         done < <(find "$WATCH_DIR" -type f \
                     -newerct "@$since" ! -newerct "@$until" \
                     -regextype posix-extended -iregex ".*\.($AUDIO_EXTENSIONS)" \
                     -print0)
-        
-        last_scan=$until
-        echo "$last_scan" > "$last_scan_file"
+
+        local scan_ok=true
+        if [ ${#batch[@]} -gt 0 ]; then
+            # Per-file failures are logged by the tagger and don't fail the
+            # batch, so a non-zero exit means nothing was tagged
+            if tag_batch "${batch[@]}"; then
+                # Record the post-tagging state so the rewrite isn't picked up
+                # again. Files that failed are recorded too, and not retried
+                # until they change.
+                for filepath in "${batch[@]}"; do
+                    sig=$(stat -c '%Y %s' "$filepath" 2>/dev/null) || continue
+                    echo "${sig}|${filepath}" >> "$processed_file"
+                done
+                log "Batch complete: ${#batch[@]} file(s)"
+            else
+                log_error "Tagger failed - retrying these files next scan"
+                scan_ok=false
+            fi
+        fi
+
+        # Keep the old scan start after a failed batch so its files stay in
+        # the next scan's window
+        if [ "$scan_ok" = true ]; then
+            last_scan=$until
+            echo "$last_scan" > "$last_scan_file"
+        fi
 
         # Drop entries by their recorded mtime. Once past the scan window a
         # file only reappears if it changes, and then its entry no longer
@@ -433,6 +470,7 @@ Environment Variables:
     WATCH_MODE      'inotify' or 'poll' - use poll for NFS/SMB mounts (default: inotify)
     POLL_INTERVAL   Poll mode: seconds between scans (default: 300)
     POLL_LOOKBACK   Poll mode: scan overlap for clock skew (default: 600)
+    WORKERS         Poll mode: parallel tagger workers, 0 = half CPU cores (default: 1)
     STATE_DIR       Poll mode: persistent state dir (default: /var/lib/essentia-tagger)
     PROCESSED_RETENTION Poll mode: seconds to remember tagged files, 0 = forever (default: 86400)
     TAGGER_SCRIPT   Path to tag_music.py

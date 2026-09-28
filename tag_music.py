@@ -138,7 +138,8 @@ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     def log(self, message, console=True, file=True):
         """Write to console and/or file"""
         if console:
-            print(message)
+            # Flush so output reaches journald/pipes per line, not per 8KB block
+            print(message, flush=True)
         if file:
             self.file_handle.write(message + '\n')
             self.file_handle.flush()
@@ -965,13 +966,27 @@ def scan_library(root_path, analyzer, tag_writer, config, logger):
         logger.log("❌ No audio files found in this directory!")
         return
     
+    process_files(audio_files, root, analyzer, tag_writer, config, logger)
+
+
+def process_files(audio_files, root, analyzer, tag_writer, config, logger):
+    """Analyze and tag a list of audio files, sequentially or in parallel"""
     logger.log(f"🎵 Found {len(audio_files)} audio files")
     logger.log(f"{'=' * 70}\n")
-    
+
     if config.workers > 1 and len(audio_files) > 1:
         _scan_parallel(audio_files, root, tag_writer, config, logger)
     else:
+        # Parallel mode skips loading models in the main process
+        if analyzer is None:
+            analyzer = EssentiaAnalyzer(config, logger)
         _scan_sequential(audio_files, root, analyzer, tag_writer, config, logger)
+
+
+def read_file_list(list_path):
+    """Read NUL-separated file paths (as written by find -print0)"""
+    data = Path(list_path).read_bytes()
+    return [Path(os.fsdecode(p)) for p in data.split(b'\0') if p]
 
 
 def _log_file_results(results, config, logger):
@@ -1746,6 +1761,14 @@ Genre format styles:
         action='store_true',
         help='Process a single file instead of directory (for file watcher integration)'
     )
+
+    parser.add_argument(
+        '--file-list',
+        type=str,
+        default=None,
+        metavar='FILE',
+        help='Process the NUL-separated paths in FILE in one run, loading models once (for file watcher integration)'
+    )
     
     # Genre settings
     parser.add_argument(
@@ -1953,14 +1976,14 @@ def main():
     logger = None
     
     # Check if we should run in automated mode
-    if args.auto or args.single_file:
+    if args.auto or args.single_file or args.file_list:
         # Automated/CLI mode
-        if not args.path:
+        if not args.path and not args.file_list:
             print("❌ Error: Path is required in automated mode")
             print("   Use: python tag_music.py /path/to/music --auto")
             sys.exit(1)
-        
-        music_path = os.path.expanduser(args.path)
+
+        music_path = os.path.expanduser(args.path or args.file_list)
         
         # Update model directory if specified
         global MODEL_DIR, EMBEDDING_MODEL, GENRE_MODEL, GENRE_METADATA, MOOD_MODEL, MOOD_METADATA
@@ -2001,6 +2024,17 @@ def main():
                 # Single file mode
                 success = process_single_file(music_path, analyzer, tag_writer, config, logger)
                 sys.exit(0 if success else 1)
+            elif args.file_list:
+                # File list mode - per-file failures are logged, not fatal
+                audio_files = [
+                    f for f in read_file_list(music_path)
+                    if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
+                ]
+                if not audio_files:
+                    logger.log("⏭️ No existing audio files in list")
+                else:
+                    root = Path(os.path.commonpath([f.parent for f in audio_files]))
+                    process_files(audio_files, root, analyzer, tag_writer, config, logger)
             else:
                 # Directory mode
                 if not os.path.isdir(music_path):

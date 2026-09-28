@@ -17,6 +17,7 @@ Environment="WATCH_DIR=/srv/dev-disk-by-uuid-dc4918d5-6597-465b-9567-ce442fbd8e2
 Environment="WATCH_MODE=inotify"
 Environment="POLL_INTERVAL=300"
 Environment="POLL_LOOKBACK=600"
+Environment="WORKERS=1"
 Environment="STATE_DIR=/var/lib/essentia-tagger"
 Environment="PROCESSED_RETENTION=86400"
 Environment="TAGGER_SCRIPT=/opt/essentia-tagger/tag_music.py"
