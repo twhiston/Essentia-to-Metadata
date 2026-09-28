@@ -61,6 +61,21 @@ OVERWRITE="${OVERWRITE:-true}"
 # Audio file extensions to watch
 AUDIO_EXTENSIONS="flac|mp3|ogg|oga|opus|m4a|m4b|mp4|aac|wma|aiff|aif|wav|wv|ape|mpc|mp\+|dsf"
 
+# Watch mode: "inotify" (instant, local disks only) or "poll" (periodic scan).
+# Use poll when WATCH_DIR is a network mount (NFS/SMB) written to by another
+# machine - inotify never sees those changes.
+WATCH_MODE="${WATCH_MODE:-inotify}"
+
+# Poll mode: seconds between scans
+POLL_INTERVAL="${POLL_INTERVAL:-300}"
+
+# Poll mode: extra seconds each scan looks back past the previous one, to
+# absorb clock skew between this machine and the NAS and slow copies
+POLL_LOOKBACK="${POLL_LOOKBACK:-600}"
+
+# Poll mode: persistent state (last scan time, processed files)
+STATE_DIR="${STATE_DIR:-/var/lib/essentia-tagger}"
+
 # Cooldown period in seconds (skip files processed within this time)
 # Prevents feedback loop when tagger writes metadata back to the file
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-120}"
@@ -99,7 +114,7 @@ log_info() {
 check_dependencies() {
     log "Checking dependencies..."
     
-    if ! command -v inotifywait &> /dev/null; then
+    if [ "$WATCH_MODE" = "inotify" ] && ! command -v inotifywait &> /dev/null; then
         log_error "inotifywait not found. Install with: apt install inotify-tools"
         exit 1
     fi
@@ -122,6 +137,11 @@ check_dependencies() {
     
     if [ ! -d "$WATCH_DIR" ]; then
         log_error "Watch directory not found: $WATCH_DIR"
+        exit 1
+    fi
+    
+    if [ "$WATCH_MODE" != "inotify" ] && [ "$WATCH_MODE" != "poll" ]; then
+        log_error "Invalid WATCH_MODE: $WATCH_MODE (use 'inotify' or 'poll')"
         exit 1
     fi
     
@@ -299,6 +319,79 @@ watch_directory() {
     done
 }
 
+# Poll loop - for network mounts where inotify doesn't see remote writes
+poll_directory() {
+    local last_scan_file="$STATE_DIR/last-scan"
+    local processed_file="$STATE_DIR/processed"
+    
+    mkdir -p "$STATE_DIR"
+    touch "$processed_file"
+    
+    log "Starting poller..."
+    log "Watching: $WATCH_DIR"
+    log "Tagger: $TAGGER_SCRIPT"
+    log "Models: $MODEL_DIR"
+    log "Logs: $LOG_DIR"
+    log "Settings: genres=$GENRES, threshold=$GENRE_THRESHOLD%, format=$GENRE_FORMAT"
+    log "Interval: ${POLL_INTERVAL}s, Lookback: ${POLL_LOOKBACK}s, Settle: ${DEBOUNCE_SECONDS}s"
+    log "State: $STATE_DIR"
+    
+    local last_scan
+    if [ -s "$last_scan_file" ]; then
+        last_scan=$(cat "$last_scan_file")
+    else
+        last_scan=$(date +%s)
+        echo "$last_scan" > "$last_scan_file"
+        log "First run - only files added from now on will be tagged"
+    fi
+    echo ""
+    
+    while true; do
+        local since=$((last_scan - POLL_LOOKBACK))
+        # Leave files changed in the last DEBOUNCE_SECONDS for the next scan,
+        # they may still be copying
+        local until=$(($(date +%s) - DEBOUNCE_SECONDS))
+        
+        # Match on ctime, not mtime: copies can preserve the source mtime, but
+        # ctime is always set when the file lands on the NAS
+        while IFS= read -r -d '' filepath; do
+            # Skip files already processed in this exact state. The tagger's
+            # own writes change ctime, so they show up here again.
+            local sig
+            sig=$(stat -c '%Y %s' "$filepath" 2>/dev/null) || continue
+            if grep -qxF "${sig}|${filepath}" "$processed_file"; then
+                continue
+            fi
+            
+            log_info "Detected: $filepath"
+            # </dev/null so the tagger can't consume the file list
+            if ! process_file "$filepath" </dev/null; then
+                log_warn "Not retrying until the file changes: $filepath"
+            fi
+            
+            # Record the post-tagging state so the rewrite isn't picked up again
+            sig=$(stat -c '%Y %s' "$filepath" 2>/dev/null) || continue
+            echo "${sig}|${filepath}" >> "$processed_file"
+        done < <(find "$WATCH_DIR" -type f \
+                    -newerct "@$since" ! -newerct "@$until" \
+                    -regextype posix-extended -iregex ".*\.($AUDIO_EXTENSIONS)" \
+                    -print0)
+        
+        last_scan=$until
+        echo "$last_scan" > "$last_scan_file"
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+# Start watching using the configured mode
+start_watching() {
+    if [ "$WATCH_MODE" = "poll" ]; then
+        poll_directory
+    else
+        watch_directory
+    fi
+}
+
 # Print help
 show_help() {
     cat << EOF
@@ -312,9 +405,15 @@ Options:
     -t, --test          Test mode - process existing files then exit
     -d, --dry-run       Enable dry run mode (no tags written)
     -r, --reset-cache   Clear processed files cache (force reprocessing)
+                        In poll mode, files changed within the lookback window
+                        will be tagged again
 
 Environment Variables:
     WATCH_DIR       Directory to watch (default: $WATCH_DIR)
+    WATCH_MODE      'inotify' or 'poll' - use poll for NFS/SMB mounts (default: inotify)
+    POLL_INTERVAL   Poll mode: seconds between scans (default: 300)
+    POLL_LOOKBACK   Poll mode: scan overlap for clock skew (default: 600)
+    STATE_DIR       Poll mode: persistent state dir (default: /var/lib/essentia-tagger)
     TAGGER_SCRIPT   Path to tag_music.py
     VENV_PATH       Path to Python venv
     MODEL_DIR       Path to Essentia models
@@ -343,6 +442,9 @@ Examples:
     
     # Override settings
     GENRES=4 GENRE_THRESHOLD=20 $0
+    
+    # Poll a network mount every 5 minutes
+    WATCH_MODE=poll $0
     
     # Shorter cooldown period (default 120s)
     COOLDOWN_SECONDS=60 $0
@@ -381,18 +483,18 @@ main() {
             exit 0
             ;;
         -r|--reset-cache)
-            rm -f "$PROCESSED_CACHE"
+            rm -f "$PROCESSED_CACHE" "$STATE_DIR/processed"
             log "Processed files cache cleared"
             exit 0
             ;;
         -d|--dry-run)
             DRY_RUN="true"
             check_dependencies
-            watch_directory
+            start_watching
             ;;
         "")
             check_dependencies
-            watch_directory
+            start_watching
             ;;
         *)
             log_error "Unknown option: $1"
